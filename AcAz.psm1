@@ -272,6 +272,85 @@ function Get-AcAzUserAssigments {
     }
 }
 
+function Resolve-AccessPlane {
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string[]] $Actions,
+
+        [Parameter()]
+        [string] $ResourceScope,
+
+        [Parameter(Mandatory)]
+        $Assignment,
+
+        [Parameter(Mandatory)]
+        [string]$Plane,
+
+        [string[]] $NotActions
+    )
+
+    begin {
+        $OpsByNamespace = @{}
+    }
+
+    process {
+
+        $resAccessList = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        foreach ($action in $Actions) {
+            Write-Verbose "Processing action '$action'"
+
+            # Parse action into namespace, provider path, and operation
+            $parts = $action.Split('/')
+            $ns    = $parts[0]
+            $prov  = $parts[0..($parts.Length - 2)] -join '/'
+            $op    = $parts[-1]
+
+            # Cache provider operations once per namespace
+            if (-not $OpsByNamespace.ContainsKey($ns)) {
+                Write-Verbose "Fetching provider operations for namespace '$ns'"
+                $OpsByNamespace[$ns] = Get-AcAzProviderOperations -action $ns -IsDataAction $false
+            }
+
+            Write-Verbose "Getting resources of type '$prov' under '$ResourceScope'"
+            $resources = Get-AcAzResource -Scope $ResourceScope -ResType $prov
+            Write-Verbose "Found $($resources.Count) matching resources"
+
+            $resources | Group-Object -Property ResourceType | ForEach-Object {
+                $type  = $_.Name
+                $group = $_.Group
+
+                Write-Verbose "Filtering operations for resource type '$type'"
+                $matches = $OpsByNamespace[$ns] | Where-Object { $_.Operation -like "$type/$op" }
+                Write-Verbose "Found $($matches.Count) matching operations for type '$type'"
+
+                foreach ($r in $group) {
+                    foreach ($mo in $matches) {
+                        if ($NotActions -and ($NotActions | Where-Object { $mo.Operation -like $_ })) {
+                            Write-Verbose "Removing operation as it cancelled out by not operation: '$($mo.Operation)'"
+                        }
+                        else {
+                            $resAccessList.Add([PSCustomObject]@{
+                                Name           = $Assignment.Name
+                                Id             = $Assignment.Id
+                                ResourceId     = $r.ResourceId
+                                ResourceType   = $type
+                                ResourceName   = $r.Name
+                                Operation      = $mo.Operation
+                                OperationType  = $mo.Operation.Split('/')[-1]
+                                Plane          = $Plane
+                            })
+                        }
+                    }
+                }
+            }
+        }
+
+        return $resAccessList
+    }
+}
+
 
 
 function Get-AcAzUserAccess {
@@ -318,9 +397,6 @@ function Get-AcAzUserAccess {
         $resScope = if ($ResourceScope) { $ResourceScope.ToLower() } else { $null }
 
         $resAccessList = [System.Collections.Generic.List[PSCustomObject]]::new()
-
-        # Cache provider operations per namespace
-        $opsByNamespace = @{}
     }
 
     process {
@@ -328,58 +404,18 @@ function Get-AcAzUserAccess {
             foreach ($scope in $assignment.scopes.Keys) {
                 Write-Verbose "Processing scope '$scope'"
                 if (-not $resScope -or $resScope.StartsWith($scope.ToLower())) {
+                    
                     $actions = $assignment.scopes[$scope].Actions
                     $notactions = $assignment.scopes[$scope].NotActions
 
-                    foreach ($action in $actions) {
-                        Write-Verbose "Processing action '$action'"
-                        #if ($action -eq '*') { continue }
+                    Resolve-AccessPlane -Actions $actions -NotActions $notactions -ResourceScope $resScope -Assignment $assignment -Plane "Control" | 
+                    ForEach-Object { $resAccessList.Add($_) }
 
-                        # Parse action into namespace, provider path, and operation
-                        $parts = $action.Split('/')
-                        $ns   = $parts[0]
-                        $prov = $parts[0..($parts.Length - 2)] -join '/'
-                        $op   = $parts[-1]
+                    $dataActions = $assignment.scopes[$scope].DataActions
+                    $notDataActions = $assignment.scopes[$scope].NotDataActions
 
-                        # Cache provider operations once per namespace
-                        if (-not $opsByNamespace.ContainsKey($ns)) {
-                            $opsByNamespace[$ns] = Get-AcAzProviderOperations -action $ns -IsDataAction $false
-                        }
-
-                        Write-Verbose "Getting resources of type '$prov' under '$ResourceScope'"
-                        $resources = Get-AcAzResource -Scope $ResourceScope -ResType $prov
-                        Write-Verbose "Found $($resources.Count) matching resources"
-
-                        $resources | Group-Object -Property ResourceType |
-                            ForEach-Object {
-                            $type    = $_.Name
-                            $group   = $_.Group
-
-                            Write-Verbose "Filtering operations for resource type '$type'"
-                            $matches = $opsByNamespace[$ns] | Where-Object { $_.Operation -like "$type/$op" }
-                            Write-Verbose "Found $($matches.Count) matching operations for type '$type'"
-
-                            foreach ($r in $group) {
-                                foreach ($mo in $matches) {
-                                if ($notactions -and ($notactions | Where-Object { $mo.Operation -like $_ })) {
-                                    Write-Verbose "Removing operation as it cancelled out by not operation: '$($mo.Operation)'"
-                                }
-                                else {
-                                    $resAccessList.Add([PSCustomObject]@{
-                                    Name          = $assignment.Name
-                                    Id            = $assignment.Id
-                                    ResourceId    = $r.ResourceId
-                                    ResourceType   = $type
-                                    ResourceName  = $r.Name
-                                    Operation     = $mo.Operation
-                                    OperationType = $mo.Operation.Split('/')[-1]
-                                    Plane         = 'Control'
-                                    })
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Resolve-AccessPlane -Actions $dataActions -NotActions $notDataActions -ResourceScope $resScope -Assignment $assignment -Plane "Data" |
+                    ForEach-Object { $resAccessList.Add($_) }
                 }
             }
         }
