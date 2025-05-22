@@ -6,13 +6,15 @@ public class EnrichedOp {
     public string OperationType;
     public string UserId;
     public string UserName;
-    public EnrichedOp(string rid, string rname, string op, string optype, string uid, string uname) {
+    public string Plane;
+    public EnrichedOp(string rid, string rname, string op, string optype, string uid, string uname, string pl) {
         ResourceId   = rid;
         ResourceName = rname;
         Operation    = op;
         OperationType= optype;
         UserId       = uid;
         UserName     = uname;
+        Plane        = pl;
     }
 }
 "@ -Language CSharp
@@ -155,8 +157,9 @@ function Get-AcAzProviderOperations {
 
     process {
         if ($action) {
-            $global:allOperations | Where-Object { $_.Operation -like "$action*" } | 
-                Where-Object {-not $PSBoundParameters.ContainsKey('IsDataAction') -or $_.IsDataAction -eq $IsDataAction}
+            $global:allOperations.Where({
+                $_.Operation -like $action -and $_.IsDataAction -eq $IsDataAction
+            })
         }
         else {$global:allOperations}
     }
@@ -255,13 +258,17 @@ function Get-AcAzRoleAssignments {
         if (-not (Get-Variable -Name allRoleAssignments -Scope Global -ErrorAction SilentlyContinue) `
             -or -not $global:allRoleAssignments)
         {
-            Write-Verbose 'Fetching all role assignments for $UserName:$UserId'
+            Write-Verbose "Fetching all role assignments for $UserName ($UserId)"
             $global:allRoleAssignments = @()
             $subs = Get-AzSubscription
             foreach ($sub in $subs) {
                 Write-Verbose "Switching to subscription $($sub.Name) ($($sub.Id))"
                 Set-AzContext -Subscription $sub.Id | Out-Null
-                $global:allRoleAssignments += Get-AzRoleAssignment -ErrorAction SilentlyContinue
+
+                $ra = Get-AzRoleAssignment -ErrorAction SilentlyContinue
+                if (-not ($global:allRoleAssignments).Where({$_.RoleAssignmentId -eq $ra.RoleAssignmentId})){
+                    $global:allRoleAssignments += $ra
+                }
             }
         }
     }
@@ -312,9 +319,11 @@ function Get-AcAzResource {
     }
 
     process {
-        if ($Scope) {
+        if ($Scope -or $ResType) {
             # Filter the fresh or cached list
-            $global:allResources | Where-Object { $_.ResourceId -like "$Scope*" } | Where-Object {$_.ResourceType -like "$ResType*"}
+            ($global:allResources).Where({
+                ($_.ResourceId -like "$Scope*") -and ($_.ResourceType -like "$ResType*")
+            }) 
         }
         else {
             # Return a shallow copy of the full list
@@ -335,11 +344,12 @@ function Resolve-AccessPlane {
         [Parameter(Mandatory)]
         [string]$Plane,
 
-        [string[]] $NotActions
+        [string[]] $NotActions,
+        [bool]$IsDataAction
     )
 
     begin {
-        $OpsByNamespace = @{}
+        $OpsByAction = @{}
     }
 
     process {
@@ -356,9 +366,29 @@ function Resolve-AccessPlane {
             $op    = $parts[-1]
 
             # Cache provider operations once per namespace
-            if (-not $OpsByNamespace.ContainsKey($ns)) {
+            if (-not $OpsByAction.ContainsKey($ns)) {
                 Write-Verbose "Fetching provider operations for namespace '$ns'"
-                $OpsByNamespace[$ns] = Get-AcAzProviderOperations -action $ns -IsDataAction $false
+                $OpsByAction[$action] = Get-AcAzProviderOperations -action $action -IsDataAction $IsDataAction
+            }
+
+            #Remove actions negated by not actions
+            $allowedOps = ($OpsByAction[$action]).Where({
+                            foreach ($notAction in $NotActions){
+                                if ($_.Operation -like $notAction) {return $false}
+                            }
+                            return $true
+                        })
+
+            $nonResourceOperations = $allowedOps.Where({-not $_.ResourceName -and $_.IsDataAction -eq $false})
+            foreach ($nonResOp in $nonResourceOperations){
+                $resAccessList.Add([PSCustomObject]@{
+                                    ResourceId     = $null
+                                    ResourceType   = $null
+                                    ResourceName   = $null
+                                    Operation      = $nonResOp.Operation
+                                    OperationType  = $nonResOp.Operation.Split('/')[-1]
+                                    Plane          = "Control"
+                                })
             }
 
             Write-Verbose "Getting resources of type '$prov' under '$ResourceScope'"
@@ -370,15 +400,11 @@ function Resolve-AccessPlane {
                 $group = $_.Group
 
                 Write-Verbose "Filtering operations for resource type '$type'"
-                $matches = $OpsByNamespace[$ns] | Where-Object { $_.Operation -like "$type/$op" }
-                Write-Verbose "Found $($matches.Count) matching operations for type '$type'"
+                $matches = $allowedOps.Where({$_.Operation -like "$type/$op"})
+                Write-Verbose "Found $($matches.Count) matching operations for a resource of type '$type'"
 
                 foreach ($r in $group) {
                     foreach ($mo in $matches) {
-                        if ($NotActions -and ($NotActions | Where-Object { $mo.Operation -like $_ })) {
-                            Write-Verbose "Removing operation as it cancelled out by not operation: '$($mo.Operation)'"
-                        }
-                        else {
                             $resAccessList.Add([PSCustomObject]@{
                                 ResourceId     = $r.ResourceId
                                 ResourceType   = $type
@@ -391,9 +417,7 @@ function Resolve-AccessPlane {
                     }
                 }
             }
-        }
-
-        return $resAccessList
+        return $resAccessList | Sort-Object ResourceId, ResourceType ,ResourceName, Operation, OperationType, Plane -Unique
     }
 }
 
@@ -414,7 +438,7 @@ function Get-AcARoleAssignmentAccess {
         [string]$ResourceScope)
 
     begin {
-        Write-Host  "Resolving assignments for role $RoleId"
+        Write-Host  "Resolving assignments for role $($Assignment.RoleDefinitionName)"
        
         $resScope = if ($ResourceScope) { $ResourceScope.ToLower() } else { $null }
 
@@ -439,14 +463,14 @@ function Get-AcARoleAssignmentAccess {
                     $notactions = $role.NotActions
 
                     Write-Verbose "Fetching control plane operations for role '$($Assignment.RoleAssignmentId)'"
-                    Resolve-AccessPlane -Actions $actions -NotActions $notactions -ResourceScope $resScope -Plane "Control" | 
+                    Resolve-AccessPlane -Actions $actions -NotActions $notactions -ResourceScope $resScope -Plane "Control" -IsDataAction $false | 
                     ForEach-Object { $roleAccessList.Add($_) }
 
                     $dataActions = $role.DataActions
                     $notDataActions = $role.NotDataActions
 
                     Write-Verbose "Fetching data plane operations for role '$($Assignment.RoleAssignmentId)'"
-                    Resolve-AccessPlane -Actions $dataActions -NotActions $notDataActions -ResourceScope $resScope -Plane "Data" |
+                    Resolve-AccessPlane -Actions $dataActions -NotActions $notDataActions -ResourceScope $resScope -Plane "Data" -IsDataAction $true |
                     ForEach-Object { $roleAccessList.Add($_) }
 
                     $global:OpsByRoleAssignment[$Assignment.RoleAssignmentId] = $roleAccessList
@@ -494,7 +518,6 @@ function Get-AcAzUserAccess {
     )
 
     begin {
-        Write-Host  "Resolving assignments for user via parameter set '$($PSCmdlet.ParameterSetName)'"
         if ($PSCmdlet.ParameterSetName -eq 'ByUPN') {
         
             $userassignments = Get-AcAzRoleAssignments -UserName $UserPrincipalName -ErrorAction SilentlyContinue
@@ -551,38 +574,19 @@ function Get-AcAzUserAccess {
                         $op.Operation,
                         $op.OperationType,
                         $currUserId,
-                        $currUserPrincipalName
+                        $currUserPrincipalName,
+                        $op.Plane
                     )
                 }
             }
         }
-
-        #foreach ($assignment in $userAssignments) {
-        #    $ops = $global:OpsByRoleAssignment[$assignment.RoleAssignmentId]
-        #    if ($ops) {
-        #        [PSCustomObject[]]$batch = foreach ($op in $ops) {
-        #            [PSCustomObject]@{
-        #                ResourceId     = $op.ResourceId
-        #                ResourceName   = $op.ResourceName
-        #                Operation      = $op.Operation
-        #                OperationType  = $op.OperationType
-        #                UserId         = $currUserId
-        #                UserName       = $currUserPrincipalName
-        #            }
-        #        }
-#
-                # now this will work without the conversion error
-#                $result.AddRange($batch)
-#                $assignmentCount++
-#            }
-#        }
 
         Write-Host  "Filtering duplicate operations..."
 
         $results = $results | Sort-Object UserId,UserName, ResourceId, ResourceName, Operation, OperationType -Unique
 
         Write-Host "Total assigned roles for $$currUserPrincipalName: $assignmentCount"
-        Write-Host "Total unique access entries: $($result.Count)"
+        Write-Host "Total unique access entries: $($results.Count)"
         return $results
     }
 }
