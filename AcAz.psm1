@@ -1,4 +1,24 @@
-function Clear-AcAzGlobalCache
+Add-Type -TypeDefinition @"
+public class EnrichedOp {
+    public string ResourceId;
+    public string ResourceName;
+    public string Operation;
+    public string OperationType;
+    public string UserId;
+    public string UserName;
+    public EnrichedOp(string rid, string rname, string op, string optype, string uid, string uname) {
+        ResourceId   = rid;
+        ResourceName = rname;
+        Operation    = op;
+        OperationType= optype;
+        UserId       = uid;
+        UserName     = uname;
+    }
+}
+"@ -Language CSharp
+
+
+function Clear-AcAzScriptCache
 {
     [CmdletBinding()]
     param()
@@ -10,6 +30,8 @@ function Clear-AcAzGlobalCache
         $global:allUsers = @()
         $global:allOperations = @()
         $global:allResourceactionProviders = @()
+        $global:OpsByRoleAssignment = @{}
+        $global:allGroupMembers = @()
     }
 }
 
@@ -33,6 +55,86 @@ function Get-AcAzResourceProvider {
         else {$global:allResourceactionProviders}
     }
 }
+
+function Test-AcAzUserGroupMembership {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $GroupId,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $UserId
+    )
+
+    begin {
+        if (-not (Get-Variable -Name allGroupMembers -Scope Global -ErrorAction SilentlyContinue) `
+            -or -not $global:allGroupMembers)
+        {
+            Write-Verbose 'Caching all group members...'
+            $global:allGroupMembers = @()
+
+            # Fetch every AAD group once
+            $allGroups = Get-AzADGroup
+
+            foreach ($grp in $allGroups) {
+                Write-Verbose "  • Loading members of '$($grp.DisplayName)' ($($grp.Id))"
+                $members = Get-AzADGroupMember -GroupObjectId $grp.Id -ErrorAction SilentlyContinue
+                $global:allGroupMembers += [PSCustomObject]@{
+                    GroupId = $grp.Id
+                    Members = $members
+                }
+            }
+        }
+    }
+
+    process {
+        function Test-Member {
+            param(
+                [string]   $CurrentGroupId,
+                [string]   $SearchUserId,
+                [string[]] $Visited
+            )
+
+            if ($Visited -contains $CurrentGroupId) { return $false }
+            $Visited += $CurrentGroupId
+
+            # Get cached entry
+            $entry = $global:allGroupMembers |
+                     Where-Object { $_.GroupId -eq $CurrentGroupId }
+            if (-not $entry) { return $false }
+
+            $members = $entry.Members
+
+            # Direct user?
+            if ($members.Id -contains $SearchUserId) {
+                return $true
+            }
+
+            # Recurse into nested groups
+            $subGroups = $members | Where-Object { $_.ObjectType -eq 'Group' }
+            foreach ($sg in $subGroups) {
+                if (Test-Member -CurrentGroupId $sg.Id `
+                                -SearchUserId $SearchUserId `
+                                -Visited $Visited) {
+                    return $true
+                }
+            }
+
+            return $false
+        }
+
+        # Kickoff with empty visited list
+        $isMember = Test-Member -CurrentGroupId $GroupId `
+                                -SearchUserId $UserId `
+                                -Visited @()
+
+        # Output boolean
+        $isMember
+    }
+}
+
 
 function Get-AcAzProviderOperations {
     [CmdletBinding()]
@@ -65,18 +167,23 @@ function Get-AcAzUsers {
     param(
     [ValidateNotNullOrEmpty()]
     [string]
-    $userId)
+    $userId,
+    [ValidateNotNullOrEmpty()]
+    [string]
+    $userPrincipalName)
 
     begin{
         if (-not (Get-Variable -Name allUsers -Scope Global -ErrorAction SilentlyContinue) -or -not $global:allUsers)
         {
-            Write-Verbose 'Fetching all users...'
-            $subs = Get-AzSubscription
+            Write-Host  'Fetching all users...'
             $global:allUsers = @()
             $global:allUsers += Get-AzAdUser
+            Write-Host  'Fetching all service principals...'
             $global:allUsers += Get-AzADServicePrincipal
+            Write-Host  'Fetching all groups...'
             $global:allUsers += Get-AzADGroup
             
+            Write-Host  'Fetching all managed identities...'
             $subs = Get-AzSubscription
             foreach ($sub in $subs) {
                 Write-Verbose "Switching to subscription $($sub.Name) ($($sub.Id))"
@@ -86,9 +193,13 @@ function Get-AcAzUsers {
         }
     }
 
-    process {
-        if ($userId) {$global:allUsers | Where-Object { $_.Id -eq $userId }}
-        else {$global:allUsers}
+    end {
+        if ($UserId -or  $userPrincipalName) {
+            $global:allUsers | Where-Object { ($_.Id -eq $UserId) -or ($_.UserPrincipalName -eq $userPrincipalName) }
+        }
+        else {
+            $global:allUsers
+        }
     }
 }
 
@@ -121,16 +232,32 @@ function Get-AcAzRoleDefinitions {
 function Get-AcAzRoleAssignments {
     [CmdletBinding()]
     param(
-    [ValidateNotNullOrEmpty()]
-    [string]
-    $userId)
+        [ValidateNotNullOrEmpty()]
+        [string] $UserId,
 
-    begin{
-        if (-not (Get-Variable -Name allRoleAssignments -Scope Global -ErrorAction SilentlyContinue) -or -not $global:allRoleAssignments)
+        [ValidateNotNullOrEmpty()]
+        [string] $UserName
+    )
+
+    begin {
+        # If they passed -UserName, resolve it to an ObjectId
+        if ($UserName) {
+            Write-Verbose "Resolving user principal name '$UserName' to object ID..."
+            $u = Get-AcAzUsers -userPrincipalName $UserName 
+            $UserId = $u.Id
+        }
+        else
         {
-            Write-Verbose 'Fetching all role assgingments...'
-            $subs = Get-AzSubscription
+            $u = Get-AcAzUsers -userId $UserId
+            $UserName = $u.UserPrincipalName
+        }
+
+        if (-not (Get-Variable -Name allRoleAssignments -Scope Global -ErrorAction SilentlyContinue) `
+            -or -not $global:allRoleAssignments)
+        {
+            Write-Verbose 'Fetching all role assignments for $UserName:$UserId'
             $global:allRoleAssignments = @()
+            $subs = Get-AzSubscription
             foreach ($sub in $subs) {
                 Write-Verbose "Switching to subscription $($sub.Name) ($($sub.Id))"
                 Set-AzContext -Subscription $sub.Id | Out-Null
@@ -140,9 +267,20 @@ function Get-AcAzRoleAssignments {
     }
 
     process {
-        $global:allRoleAssignments | Where-Object { $_.ObjectId -eq $userId }
+        if (-not $UserId) {
+            $global:allRoleAssignments
+        }
+        else {
+            $global:allRoleAssignments |
+              Where-Object {
+                  ($_.ObjectId -eq $UserId) -or
+                  ($_.ObjectType -eq 'Group' -and
+                   (Test-AcAzUserGroupMembership -GroupId $_.ObjectId -UserId $UserId))
+              }
+        }
     }
 }
+
 
 
 function Get-AcAzResource {
@@ -185,93 +323,6 @@ function Get-AcAzResource {
     }
 }
 
-function Get-AcAzUserAssigments {
-    [CmdletBinding(DefaultParameterSetName = 'ByUPN')]
-    param(
-        [Parameter(
-            Mandatory        = $true,
-            ParameterSetName = 'ByUPN',
-            Position         = 0,
-            HelpMessage      = 'User Principal Name (e.g. alice@contoso.com)'
-        )]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $UserPrincipalName,
-
-        [Parameter(
-            Mandatory        = $true,
-            ParameterSetName = 'ById',
-            Position         = 0,
-            HelpMessage      = 'Azure AD ObjectId GUID'
-        )]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $UserId
-    )
-
-    begin {
-        # Resolve the AD user object based on input
-        if ($PSCmdlet.ParameterSetName -eq 'ByUPN') {
-            Write-Verbose "Resolving user by UPN: $UserPrincipalName"
-            $user = Get-AzADUser -UserPrincipalName $UserPrincipalName -ErrorAction SilentlyContinue
-        }
-        else {
-            Write-Verbose "Resolving user by ObjectId: $UserId"
-            $user = Get-AzADUser -ObjectId $UserId -ErrorAction SilentlyContinue
-        }
-
-        if (-not $user) {
-            Throw "User not found in Azure AD."
-        }
-    }
-
-    process {
-        $assignments = Get-AcAzRoleAssignments -userId $user.Id
-
-        if (-not $assignments) {
-            Write-Warning "No role assignments found for user $($user.DisplayName)"
-            return
-        }
-
-        $uroles = @{}
-        $uroles["Id"]             = $user.Id
-        $uroles["Name"]           = $user.UserPrincipalName
-        $uroles["scopes"] = @{}
-
-        
-
-        $assignments | ForEach-Object { 
-            $role_defs = Get-AcAzRoleDefinitions -roleId $_.RoleDefinitionId
-            $scope = $_.Scope
-            $resources = Get-AcAzResource -Scope $scope
-            
-            if (-not $uroles["scopes"].ContainsKey($scope)) {
-                $uroles["scopes"][$scope] = @{
-                Actions     = @()
-                DataActions = @()
-                NotActions  = @()
-                NotDataActions = @()
-                Resources = @()
-                }
-            }
-            
-            $uroles["scopes"][$scope].Actions += $role_defs.Actions | Select-Object -Unique
-            $uroles["scopes"][$scope].NotActions += $role_defs.NotActions | Select-Object -Unique
-            $uroles["scopes"][$scope].DataActions += $role_defs.DataActions | Select-Object -Unique
-            $uroles["scopes"][$scope].NotDataActions += $role_defs.NotDataActions | Select-Object -Unique
-
-            if ($resources)
-            {
-                $resourceIds = $resources | Select-Object -ExpandProperty ResourceId
-                $resourceIdStrings = [string[]]$resourceIds 
-                $uroles["scopes"]["$scope"].Resources += $resourceIdStrings | Select-Object -Unique
-            }
-        }
-
-        $uroles
-    }
-}
-
 function Resolve-AccessPlane {
     [CmdletBinding()]
     param(
@@ -280,9 +331,6 @@ function Resolve-AccessPlane {
 
         [Parameter()]
         [string] $ResourceScope,
-
-        [Parameter(Mandatory)]
-        $Assignment,
 
         [Parameter(Mandatory)]
         [string]$Plane,
@@ -332,8 +380,6 @@ function Resolve-AccessPlane {
                         }
                         else {
                             $resAccessList.Add([PSCustomObject]@{
-                                Name           = $Assignment.Name
-                                Id             = $Assignment.Id
                                 ResourceId     = $r.ResourceId
                                 ResourceType   = $type
                                 ResourceName   = $r.Name
@@ -351,6 +397,72 @@ function Resolve-AccessPlane {
     }
 }
 
+function Get-AcARoleAssignmentAccess {
+    [CmdletBinding(DefaultParameterSetName = 'ByUPN')]
+    param(
+        [Parameter(
+            Mandatory        = $true,
+            Position         = 0,
+            HelpMessage      = 'Role Id'
+        )]
+        [ValidateNotNullOrEmpty()]
+        $Assignment,
+        [Parameter(
+            Mandatory   = $false,
+            HelpMessage = 'Optional scope to filter results (e.g. /subscriptions/<id>)'
+        )]
+        [string]$ResourceScope)
+
+    begin {
+        Write-Host  "Resolving assignments for role $RoleId"
+       
+        $resScope = if ($ResourceScope) { $ResourceScope.ToLower() } else { $null }
+
+        $roleAccessList = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        if (-not $global:OpsByRoleAssignment) {
+            Write-Verbose "Initializing role assugment cache..."
+            $global:OpsByRoleAssignment = @{}
+        }
+    }
+
+    process {
+        $roles = Get-AcAzRoleDefinitions -roleId $Assignment.RoleDefinitionId
+        foreach ($role in $roles) {
+            $scope = $Assignment.Scope
+            if ( -not $global:OpsByRoleAssignment.ContainsKey($Assignment.RoleAssignmentId)){
+
+                Write-Host  "Processing Role '$($role.Name)' for scope '$scope'"
+                if (-not $resScope -or $resScope.StartsWith($scope.ToLower())) {
+                    
+                    $actions = $role.Actions
+                    $notactions = $role.NotActions
+
+                    Write-Verbose "Fetching control plane operations for role '$($Assignment.RoleAssignmentId)'"
+                    Resolve-AccessPlane -Actions $actions -NotActions $notactions -ResourceScope $resScope -Plane "Control" | 
+                    ForEach-Object { $roleAccessList.Add($_) }
+
+                    $dataActions = $role.DataActions
+                    $notDataActions = $role.NotDataActions
+
+                    Write-Verbose "Fetching data plane operations for role '$($Assignment.RoleAssignmentId)'"
+                    Resolve-AccessPlane -Actions $dataActions -NotActions $notDataActions -ResourceScope $resScope -Plane "Data" |
+                    ForEach-Object { $roleAccessList.Add($_) }
+
+                    $global:OpsByRoleAssignment[$Assignment.RoleAssignmentId] = $roleAccessList
+                }
+            }
+            else {Write-Verbose "Role assigment already cached : '$($Assignment.RoleDefinitionName) : $($Assignment.RoleDefinitionId)'"}
+        }
+    }
+
+    end {
+        Write-Host  "Sorting and de-duplicating results for Role '$($Assignment.RoleDefinitionName)'"
+        $result = $result |    Sort-Object ResourceId, ResourceName, Operation, OperationType -Unique
+        Write-Host  "Total unique access entries: $($result.Count)"
+        return $result
+    }
+}
 
 
 function Get-AcAzUserAccess {
@@ -382,57 +494,119 @@ function Get-AcAzUserAccess {
     )
 
     begin {
-        Write-Verbose "Resolving assignments for user via parameter set '$($PSCmdlet.ParameterSetName)'"
+        Write-Host  "Resolving assignments for user via parameter set '$($PSCmdlet.ParameterSetName)'"
         if ($PSCmdlet.ParameterSetName -eq 'ByUPN') {
-            $userassignments = Get-AcAzUserAssigments -UserPrincipalName $UserPrincipalName -ErrorAction SilentlyContinue
+        
+            $userassignments = Get-AcAzRoleAssignments -UserName $UserPrincipalName -ErrorAction SilentlyContinue
+            $currUserId = (Get-AcAzUsers -userPrincipalName $UserPrincipalName).Id 
+            $currUserPrincipalName = $UserPrincipalName
         }
         else {
-            $userassignments = Get-AcAzUserAssigments -UserId $UserId -ErrorAction SilentlyContinue
+            $userassignments = Get-AcAzRoleAssignments -UserId $UserId -ErrorAction SilentlyContinue
+            $currUserPrincipalName = (Get-AcAzUsers -userId $UserId).UserPrincipalName
+            $currUserId = $UserId 
+
         }
         if (-not $userassignments) {
-            Throw "Could not find User Assignments for user."
+            Write-Warning "Could not find User Assignments for user $((@($UserPrincipalName, $UserId, ("Unknown")) | Where-Object { $_ -ne $null} | Select-Object -First 1))"
+            return
         }
         Write-Verbose "Found $($userassignments.Count) assignment(s)."
 
         $resScope = if ($ResourceScope) { $ResourceScope.ToLower() } else { $null }
-
-        $resAccessList = [System.Collections.Generic.List[PSCustomObject]]::new()
     }
 
     process {
         foreach ($assignment in $userassignments) {
-            foreach ($scope in $assignment.scopes.Keys) {
-                Write-Verbose "Processing scope '$scope'"
-                if (-not $resScope -or $resScope.StartsWith($scope.ToLower())) {
-                    
-                    $actions = $assignment.scopes[$scope].Actions
-                    $notactions = $assignment.scopes[$scope].NotActions
 
-                    Resolve-AccessPlane -Actions $actions -NotActions $notactions -ResourceScope $resScope -Assignment $assignment -Plane "Control" | 
-                    ForEach-Object { $resAccessList.Add($_) }
-
-                    $dataActions = $assignment.scopes[$scope].DataActions
-                    $notDataActions = $assignment.scopes[$scope].NotDataActions
-
-                    Resolve-AccessPlane -Actions $dataActions -NotActions $notDataActions -ResourceScope $resScope -Assignment $assignment -Plane "Data" |
-                    ForEach-Object { $resAccessList.Add($_) }
-                }
-            }
+            Get-AcARoleAssignmentAccess -Assignment $assignment -ResourceScope $resScope
         }
     }
 
     end {
-        Write-Verbose "Sorting and de-duplicating results"
-        $result = $resAccessList |
-            Sort-Object Name, Id, ResourceId, ResourceName, Operation, OperationType -Unique
-        Write-Verbose "Total unique access entries: $($result.Count)"
-        return $result
+        Write-Host  "Collecting assignments and their access for '$currUserPrincipalName':'$currUserId'"
+        
+        $assignmentCount = 0
+        [int]$totalCount = 0
+        foreach ($a in $userAssignments) {
+            $ops = $global:OpsByRoleAssignment[$a.RoleAssignmentId]
+            if ($ops) { 
+                $totalCount += $ops.Count 
+                $assignmentCount++
+            }
+        }
+
+        [EnrichedOp[]]$results = New-Object EnrichedOp[] $totalCount
+        [int]$idx = 0
+
+        
+
+        foreach ($a in $userAssignments) {
+            $ops = $global:OpsByRoleAssignment[$a.RoleAssignmentId]
+            if ($ops) {
+                foreach ($op in $ops) {
+                    $results[$idx++] = [EnrichedOp]::new(
+                        $op.ResourceId,
+                        $op.ResourceName,
+                        $op.Operation,
+                        $op.OperationType,
+                        $currUserId,
+                        $currUserPrincipalName
+                    )
+                }
+            }
+        }
+
+        #foreach ($assignment in $userAssignments) {
+        #    $ops = $global:OpsByRoleAssignment[$assignment.RoleAssignmentId]
+        #    if ($ops) {
+        #        [PSCustomObject[]]$batch = foreach ($op in $ops) {
+        #            [PSCustomObject]@{
+        #                ResourceId     = $op.ResourceId
+        #                ResourceName   = $op.ResourceName
+        #                Operation      = $op.Operation
+        #                OperationType  = $op.OperationType
+        #                UserId         = $currUserId
+        #                UserName       = $currUserPrincipalName
+        #            }
+        #        }
+#
+                # now this will work without the conversion error
+#                $result.AddRange($batch)
+#                $assignmentCount++
+#            }
+#        }
+
+        Write-Host  "Filtering duplicate operations..."
+
+        $results = $results | Sort-Object UserId,UserName, ResourceId, ResourceName, Operation, OperationType -Unique
+
+        Write-Host "Total assigned roles for $$currUserPrincipalName: $assignmentCount"
+        Write-Host "Total unique access entries: $($result.Count)"
+        return $results
+    }
+}
+
+function Get-AcAzAllUsersAccess {
+    [CmdletBinding()]
+    param()
+    
+    begin {
+            Write-Host  "Collecting assignments for all users and converting to access objects..."
+    }
+    process {
+        $allAccess = Get-AcAzUsers | ForEach-Object {Get-AcAzUserAccess -UserId $_.Id}
+    }
+
+    end 
+    {
+        return $allAccess
     }
 }
 
 
-
 # Export the function when the module is imported
-Export-ModuleMember -Function Get-AcAzUserAssigments,Get-AcAzResource,
-                                Get-AcAzRoleAssignments,Clear-AcAzGlobalCache,Get-AcAzUserAccess,
-                                Get-AcAzUsers,Get-AcAzProviderOperations,Get-AcAzResourceProvider
+Export-ModuleMember -Function Get-AcAzUserAssigments,Get-AcAzResource,Test-AcAzUserGroupMembership,
+                                Get-AcAzRoleAssignments,Clear-AcAzScriptCache,Get-AcAzUserAccess,
+                                Get-AcAzUsers,Get-AcAzProviderOperations,Get-AcAzResourceProvider,
+                                Get-AcAzAllUsersAccess
