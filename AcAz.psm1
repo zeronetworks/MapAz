@@ -2,14 +2,16 @@ Add-Type -TypeDefinition @"
 public class EnrichedOp {
     public string ResourceId;
     public string ResourceName;
+    public string ResourceType;
     public string Operation;
     public string OperationType;
     public string UserId;
     public string UserName;
     public string Plane;
-    public EnrichedOp(string rid, string rname, string op, string optype, string uid, string uname, string pl) {
+    public EnrichedOp(string rid, string rname, string rtype,string op, string optype, string uid, string uname, string pl) {
         ResourceId   = rid;
         ResourceName = rname;
+        ResourceType = rtype;
         Operation    = op;
         OperationType= optype;
         UserId       = uid;
@@ -198,8 +200,10 @@ function Get-AcAzUsers {
 
     end {
         if ($UserId -or  $userPrincipalName) {
-            $global:allUsers | Where-Object { ($_.Id -eq $UserId) -or ($_.UserPrincipalName -eq $userPrincipalName) }
-        }
+            $matches = $global:allUsers | Where-Object { ($_.Id -eq $UserId) -or ($_.UserPrincipalName -eq $userPrincipalName) }
+            if (-not $matches) { Write-Warning "No user found with Id $UserId or UPN $userPrincipalName."}
+            return $matches
+        }           
         else {
             $global:allUsers
         }
@@ -274,7 +278,7 @@ function Get-AcAzRoleAssignments {
     }
 
     process {
-        if (-not $UserId) {
+        if (-not $UserId -and -not $UserName) {
             $global:allRoleAssignments
         }
         else {
@@ -571,6 +575,7 @@ function Get-AcAzUserAccess {
                     $results[$idx++] = [EnrichedOp]::new(
                         $op.ResourceId,
                         $op.ResourceName,
+                        $op.ResourceType,
                         $op.Operation,
                         $op.OperationType,
                         $currUserId,
@@ -583,7 +588,7 @@ function Get-AcAzUserAccess {
 
         Write-Host  "Filtering duplicate operations..."
 
-        $results = $results | Sort-Object UserId,UserName, ResourceId, ResourceName, Operation, OperationType -Unique
+        $results = $results | Sort-Object UserId,UserName, ResourceId, ResourceName, ResourceType, Operation, OperationType -Unique
 
         Write-Host "Total assigned roles for $$currUserPrincipalName: $assignmentCount"
         Write-Host "Total unique access entries: $($results.Count)"
