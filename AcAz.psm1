@@ -42,16 +42,14 @@ function Clear-AcAzScriptCache
 function Get-AcAzResourceProvider {
     [CmdletBinding()]
     param(
-    [ValidateNotNullOrEmpty()]
     [string]
     $NameSpace)
 
     begin{
-        if (-not (Get-Variable -Name allOperations -Scope Global -ErrorAction SilentlyContinue) -or -not $global:allResourceactionProviders)
-        {
+        if (-not (Get-Variable -Name allResourceactionProviders -Scope Global -ErrorAction SilentlyContinue) -or -not $global:allResourceactionProviders){
             Write-Verbose 'Fetching all resource actionProviders...'
             $global:allResourceactionProviders += Get-AzResourceProvider -ErrorAction SilentlyContinue
-            }
+        }
     }
 
     process {
@@ -201,7 +199,7 @@ function Get-AcAzUsers {
     end {
         if ($UserId -or  $userPrincipalName) {
             $matches = $global:allUsers | Where-Object { ($_.Id -eq $UserId) -or ($_.UserPrincipalName -eq $userPrincipalName) }
-            if (-not $matches) { Write-Warning "No user found with Id $UserId or UPN $userPrincipalName."}
+            if (-not $matches) { Write-Warninfg "No user found with Id $UserId or UPN $userPrincipalName."}
             return $matches
         }           
         else {
@@ -292,7 +290,143 @@ function Get-AcAzRoleAssignments {
     }
 }
 
+function Get-AzProviderErrorInfo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [string[]]$Message
+    )
+    process {
+        foreach ($msg in $Message) {
+            # extract the comma-separated api-versions inside single quotes
+            $apiMatch = [regex]::Match($msg, "supported api-versions are '([^']+)'")
+            $apiVersions = if ($apiMatch.Success) {
+                $apiMatch.Groups[1].Value `
+                  -split ',' `
+                  | ForEach-Object { $_.Trim() } `
+                  | Where-Object { $_ -ne '' }
+            } else { @() }
 
+            # extract the comma-separated locations inside single quotes
+            $locMatch = [regex]::Match($msg, "supported locations are '([^']+)'")
+            $locations = if ($locMatch.Success) {
+                $locMatch.Groups[1].Value `
+                  -split ',' `
+                  | ForEach-Object { $_.Trim() } `
+                  | Where-Object { $_ -ne '' }
+            } else { @() }
+
+            # output a structured object
+            [PSCustomObject]@{
+                Message     = $msg
+                ApiVersions = $apiVersions
+                Locations   = $locations
+            }
+        }
+    }
+}
+
+function Get-AcAzResourceViaRESTAPI {
+    [CmdletBinding()]
+    param([string]$Uri)
+
+    begin {
+        $script:apiver = "2021-04-01"
+    }
+    
+    process {
+        $uriAndApi = $Uri + "?api-version=" + $script:apiver
+
+        Write-Debug "Trying to GET resource at URI: $uriAndApi"
+        $httpResp = Invoke-AzRestMethod -Method GET -Path $uriAndApi
+        if ($httpResp.StatusCode -ne 200) {
+
+            $statuscode = $httpResp.StatusCode
+            $httpJson = $httpResp.Content | ConvertFrom-Json
+            $errorCode = $httpJson.error.code
+
+            Write-Verbose "Got error $statuscode : $errorCode for URI: $uri"
+
+            if ($errorCode -like "NoRegisteredProviderFound") {
+                $errMsg = $httpJson.error.Message | Get-AzProviderErrorInfo
+                if ($errMsg.ApiVersions) {
+                    $script:apiver = $errMsg.ApiVersions[-1]
+                    $uriAndApi = $Uri + "?api-version=" + $script:apiver
+
+                    Write-Verbose "Changing API versoin, trying URI: $uriAndApi"
+                    $httpResp = Invoke-AzRestMethod -Method GET -Path $uriAndApi
+                }
+            }
+        }
+        
+        if ($httpResp.StatusCode -ne 200) {
+            try{
+                $httpJson = $httpResp.Content | ConvertFrom-Json
+                $errorCode = $httpJson.error.code
+                Write-Verbose "Got error $statuscode : $errorCode for URI: $uri"
+            }
+            catch {
+                Write-Debug "Http content is not JSON!"
+            }
+        }  
+
+        $httpResp
+    }
+}
+
+
+function Get-AcAzResourceAndSubResources {
+    [CmdletBinding()]
+    param(
+        [string]$SubscriptionId,
+        [string]$ResGroup,
+        [string]$ProviderName,
+        [string]$ResourceName,
+        [string]$ResourceType)
+
+    begin {
+
+        if (-not $global:allResources) { $global:allResources= @()}
+
+    }
+
+    process {
+        Write-Host "Scanning sub resources for resource: $ResourceName at group: $ResGroup"
+
+        foreach ($subResType in ((Get-AcAzResourceProvider -NameSpace $ProviderName).ResourceTypes.ResourceTypeName).Where({$_ -like "$ResourceType/*"})){
+            $subType = $subResType.Replace("$ResourceType/","")
+            $subResId = "/subscriptions/$SubscriptionId/resourceGroups/$ResGroup/providers/$ProviderName/$ResourceType/$ResourceName/$subType"
+            if (-not (($global:allResources).ResourceId -contains $subResId)){
+                Write-Verbose "Trying to get sub resource $subResId"
+
+                
+                $httpResp = Get-AcAzResourceViaRESTAPI -Uri $subResId
+                if ($httpResp.StatusCode -eq 200) {
+                    try {
+                        $subResources = ($httpResp.Content | ConvertFrom-Json).value
+                    }
+                    catch {
+                        Write-Debug "Failed to parse JSON for URI $($item.Uri): $($_.Exception.Message)"
+                    }
+                    foreach ($subResource in $subResources){
+                        if ($subResource.PSObject.Properties.Name -contains "Id"){ 
+                            Write-Host "Found sub resource: $($subResource.Id)" -ForegroundColor Green
+                            $results = Get-AzResource -ResourceId $subResource.Id -ErrorAction SilentlyContinue
+                            foreach ($res in $results){
+                                if (($res.PSObject.Properties.Name -contains "ResourceType") -and $res.ResourceType){
+                                    $global:allResources += $res
+                                    $subrestype = $res.ResourceType.Replace("$ProviderName/","")
+                                    Get-AcAzResourceAndSubResources -SubscriptionId $SubscriptionId -ResGroup $ResGroup -ProviderName $ProviderName -ResourceName $res.Name -ResourceType $subrestype
+                                }
+                                else {Write-Debug "No type for resource $($res.Id)"}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 function Get-AcAzResource {
     [CmdletBinding()]
@@ -305,20 +439,34 @@ function Get-AcAzResource {
         [Parameter(
             HelpMessage = 'Optional resource type to filter (e.g., Microsoft.Compute/virtualMachines)'
         )]
-        [string]$ResType
+        [string]$ResType,
+        [switch]$ScanSubResources
     )
 
     begin {
-        if (-not (Get-Variable -Name allResources -Scope Global -ErrorAction SilentlyContinue) -or -not $global:allResources)
-        {
+        if (-not (Get-Variable -Name allResources -Scope Global -ErrorAction SilentlyContinue) -or -not $global:allResources){
+
             Write-Verbose 'Fetching all subscriptions and resources...'
             $subs = Get-AzSubscription
             $global:allResources = @()
             foreach ($sub in $subs) {
-                Write-Verbose "Switching to subscription $($sub.Name) ($($sub.Id))"
+                Write-Host "Switching to subscription $($sub.Name) ($($sub.Id))"
                 Set-AzContext -Subscription $sub.Id | Out-Null
-                $global:allResources += Get-AzResource -ErrorAction SilentlyContinue
+
+                $resources = Get-AzResource -ErrorAction SilentlyContinue
+                foreach ($res in $resources){
+                    if (-not (($global:allResources).ResourceId -contains $res.Id)){
+                            $global:allResources += $res
+                        }
+
+                    if ($ScanSubResources.IsPresent){
+                        $providerName = $res.ResourceType.Split("/")[0]
+                        $resType = $res.ResourceType.Replace("$providerName/","")
+                        Get-AcAzResourceAndSubResources -SubscriptionId $sub -ResGroup $res.ResourceGroupName -ProviderName $providerName -ResourceName $res.Name -ResourceType $resType
+                    } 
+                }                     
             }
+                     
         }
     }
 
@@ -340,6 +488,7 @@ function Resolve-AccessPlane {
     [CmdletBinding()]
     param(
         [Parameter()]
+
         [string[]] $Actions,
 
         [Parameter()]
@@ -618,4 +767,4 @@ function Get-AcAzAllUsersAccess {
 Export-ModuleMember -Function Get-AcAzUserAssigments,Get-AcAzResource,Test-AcAzUserGroupMembership,
                                 Get-AcAzRoleAssignments,Clear-AcAzScriptCache,Get-AcAzUserAccess,
                                 Get-AcAzUsers,Get-AcAzProviderOperations,Get-AcAzResourceProvider,
-                                Get-AcAzAllUsersAccess
+                                Get-AcAzAllUsersAccess,Get-AcAzResourceViaRESTAPI,Get-AcAzResourceAndSubResources
