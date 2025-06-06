@@ -21,8 +21,7 @@ public class EnrichedOp {
 }
 "@ -Language CSharp
 
-
-function Clear-AcAzScriptCache
+function Clear-MapAzScriptCache
 {
     [CmdletBinding()]
     param()
@@ -39,7 +38,7 @@ function Clear-AcAzScriptCache
     }
 }
 
-function Get-AcAzResourceProvider {
+function Get-MapAzResourceProvider {
     [CmdletBinding()]
     param(
     [string]
@@ -58,7 +57,7 @@ function Get-AcAzResourceProvider {
     }
 }
 
-function Test-AcAzUserGroupMembership {
+function Test-MapAzUserGroupMembership {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -137,8 +136,7 @@ function Test-AcAzUserGroupMembership {
     }
 }
 
-
-function Get-AcAzProviderOperations {
+function Get-MapAzProviderOperations {
     [CmdletBinding()]
     param(
     [ValidateNotNullOrEmpty()]
@@ -165,7 +163,7 @@ function Get-AcAzProviderOperations {
     }
 }
 
-function Get-AcAzUsers {
+function Get-MapAzUsers {
     [CmdletBinding()]
     param(
     [ValidateNotNullOrEmpty()]
@@ -199,7 +197,7 @@ function Get-AcAzUsers {
     end {
         if ($UserId -or  $userPrincipalName) {
             $matches = $global:allUsers | Where-Object { ($_.Id -eq $UserId) -or ($_.UserPrincipalName -eq $userPrincipalName) }
-            if (-not $matches) { Write-Warninfg "No user found with Id $UserId or UPN $userPrincipalName."}
+            if (-not $matches) { Write-Warning "No user found with Id $UserId or UPN $userPrincipalName."}
             return $matches
         }           
         else {
@@ -208,7 +206,7 @@ function Get-AcAzUsers {
     }
 }
 
-function Get-AcAzRoleDefinitions {
+function Get-MapAzRoleDefinitions {
     [CmdletBinding()]
     param(
     [ValidateNotNullOrEmpty()]
@@ -234,7 +232,7 @@ function Get-AcAzRoleDefinitions {
     }
 }
 
-function Get-AcAzRoleAssignments {
+function Get-MapAzRoleAssignments {
     [CmdletBinding()]
     param(
         [ValidateNotNullOrEmpty()]
@@ -248,12 +246,12 @@ function Get-AcAzRoleAssignments {
         # If they passed -UserName, resolve it to an ObjectId
         if ($UserName) {
             Write-Verbose "Resolving user principal name '$UserName' to object ID..."
-            $u = Get-AcAzUsers -userPrincipalName $UserName 
+            $u = Get-MapAzUsers -userPrincipalName $UserName 
             $UserId = $u.Id
         }
         else
         {
-            $u = Get-AcAzUsers -userId $UserId
+            $u = Get-MapAzUsers -userId $UserId
             $UserName = $u.UserPrincipalName
         }
 
@@ -284,13 +282,13 @@ function Get-AcAzRoleAssignments {
               Where-Object {
                   ($_.ObjectId -eq $UserId) -or
                   ($_.ObjectType -eq 'Group' -and
-                   (Test-AcAzUserGroupMembership -GroupId $_.ObjectId -UserId $UserId))
+                   (Test-MapAzUserGroupMembership -GroupId $_.ObjectId -UserId $UserId))
               }
         }
     }
 }
 
-function Get-AzProviderErrorInfo {
+function Get-MapAzProviderErrorInfo {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory, ValueFromPipeline)]
@@ -326,18 +324,76 @@ function Get-AzProviderErrorInfo {
     }
 }
 
-function Get-AcAzResourceViaRESTAPI {
+function Get-MapAzResourceViaRESTAPINative {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position=0)]
+        [string]$Uri,
+
+        [Parameter(Mandatory, Position=1)]
+        [string]$Token
+    )
+
+    begin {
+        # Default API version
+        $script:apiver = "2021-04-01"
+    }
+
+    process {
+        $uriAndApi = $Uri + "?api-version=" + $script:apiver
+
+        Write-Verbose "Trying to GET resource at URI: $uriAndApi"
+        $httpResp = Invoke-WebRequest -Method GET -Uri $uriAndApi -Headers @{ Authorization = "Bearer $Token" } -SkipHttpErrorCheck
+        if ($httpResp.StatusCode -ne 200) {
+
+            $statuscode = $httpResp.StatusCode
+            $httpJson = $httpResp.Content | ConvertFrom-Json
+            $errorCode = $httpJson.error.code
+
+            Write-Debug "Got error $statuscode : $errorCode for URI: $uri"
+
+            if ($errorCode -like "NoRegisteredProviderFound") {
+                $errMsg = $httpJson.error.Message | Get-MapAzProviderErrorInfo
+                if ($errMsg.ApiVersions) {
+                    $script:apiver = $errMsg.ApiVersions[-1]
+                    $uriAndApi = $Uri + "?api-version=" + $script:apiver
+
+                    Write-Debug "Changing API versoin, trying URI: $uriAndApi"
+                    $httpResp = Invoke-WebRequest -Method GET -Uri $uriAndApi -Headers @{ Authorization = "Bearer $Token" } -SkipHttpErrorCheck
+                }
+            }
+        }
+        
+        if ($httpResp.StatusCode -ne 200) {
+            try{
+                $httpJson = $httpResp.Content | ConvertFrom-Json
+                $errorCode = $httpJson.error.code
+                Write-Debug "Got error $statuscode : $errorCode for URI: $uri"
+            }
+            catch {
+                Write-Debug "Http content is not JSON!"
+            }
+        }  
+
+        $httpResp
+    }
+}
+
+
+
+function Get-MapAzResourceViaRESTAPI {
     [CmdletBinding()]
     param([string]$Uri)
 
     begin {
+        #Import-Module Az
         $script:apiver = "2021-04-01"
     }
     
     process {
         $uriAndApi = $Uri + "?api-version=" + $script:apiver
 
-        Write-Debug "Trying to GET resource at URI: $uriAndApi"
+        Write-Verbose "Trying to GET resource at URI: $uriAndApi"
         $httpResp = Invoke-AzRestMethod -Method GET -Path $uriAndApi
         if ($httpResp.StatusCode -ne 200) {
 
@@ -345,15 +401,15 @@ function Get-AcAzResourceViaRESTAPI {
             $httpJson = $httpResp.Content | ConvertFrom-Json
             $errorCode = $httpJson.error.code
 
-            Write-Verbose "Got error $statuscode : $errorCode for URI: $uri"
+            Write-Debug "Got error $statuscode : $errorCode for URI: $uri"
 
             if ($errorCode -like "NoRegisteredProviderFound") {
-                $errMsg = $httpJson.error.Message | Get-AzProviderErrorInfo
+                $errMsg = $httpJson.error.Message | Get-MapAzProviderErrorInfo
                 if ($errMsg.ApiVersions) {
                     $script:apiver = $errMsg.ApiVersions[-1]
                     $uriAndApi = $Uri + "?api-version=" + $script:apiver
 
-                    Write-Verbose "Changing API versoin, trying URI: $uriAndApi"
+                    #Write-Debug "Changing API versoin, trying URI: $uriAndApi"
                     $httpResp = Invoke-AzRestMethod -Method GET -Path $uriAndApi
                 }
             }
@@ -374,8 +430,7 @@ function Get-AcAzResourceViaRESTAPI {
     }
 }
 
-
-function Get-AcAzResourceAndSubResources {
+function Get-MapAzResourceAndSubResources {
     [CmdletBinding()]
     param(
         [string]$SubscriptionId,
@@ -393,14 +448,13 @@ function Get-AcAzResourceAndSubResources {
     process {
         Write-Host "Scanning sub resources for resource: $ResourceName at group: $ResGroup"
 
-        foreach ($subResType in ((Get-AcAzResourceProvider -NameSpace $ProviderName).ResourceTypes.ResourceTypeName).Where({$_ -like "$ResourceType/*"})){
+        foreach ($subResType in ((Get-MapAzResourceProvider -NameSpace $ProviderName).ResourceTypes.ResourceTypeName).Where({$_ -like "$ResourceType/*"})){
             $subType = $subResType.Replace("$ResourceType/","")
             $subResId = "/subscriptions/$SubscriptionId/resourceGroups/$ResGroup/providers/$ProviderName/$ResourceType/$ResourceName/$subType"
             if (-not (($global:allResources).ResourceId -contains $subResId)){
                 Write-Verbose "Trying to get sub resource $subResId"
-
-                
-                $httpResp = Get-AcAzResourceViaRESTAPI -Uri $subResId
+   
+                $httpResp = Get-MapAzResourceViaRESTAPI -Uri $subResId
                 if ($httpResp.StatusCode -eq 200) {
                     try {
                         $subResources = ($httpResp.Content | ConvertFrom-Json).value
@@ -409,16 +463,23 @@ function Get-AcAzResourceAndSubResources {
                         Write-Debug "Failed to parse JSON for URI $($item.Uri): $($_.Exception.Message)"
                     }
                     foreach ($subResource in $subResources){
-                        if ($subResource.PSObject.Properties.Name -contains "Id"){ 
-                            Write-Host "Found sub resource: $($subResource.Id)" -ForegroundColor Green
-                            $results = Get-AzResource -ResourceId $subResource.Id -ErrorAction SilentlyContinue
-                            foreach ($res in $results){
-                                if (($res.PSObject.Properties.Name -contains "ResourceType") -and $res.ResourceType){
-                                    $global:allResources += $res
-                                    $subrestype = $res.ResourceType.Replace("$ProviderName/","")
-                                    Get-AcAzResourceAndSubResources -SubscriptionId $SubscriptionId -ResGroup $ResGroup -ProviderName $ProviderName -ResourceName $res.Name -ResourceType $subrestype
+                        if (($subResource.PSObject.Properties.Name -contains "Id") -and ($subResource.PSObject.Properties.Name -contains "type")){ 
+                             if($subResource.type -like "$ProviderName*"){
+                                Write-Host "Found sub resource: $($subResource.Id)" -ForegroundColor Green
+                                $results = Get-AzResource -ResourceId $subResource.Id -ErrorAction SilentlyContinue
+                                foreach ($res in $results){
+                                    if (($res.PSObject.Properties.Name -contains "ResourceType") -and $res.ResourceType){
+                                        $global:allResources += $res
+                                        $subrestype = $res.ResourceType.Replace("$ProviderName/","")
+                                        Get-MapAzResourceAndSubResources -SubscriptionId $SubscriptionId -ResGroup $ResGroup -ProviderName $ProviderName -ResourceName $res.Name -ResourceType $subrestype
+                                    }
+                                    else {Write-Debug "No type for resource $($res.Id)"}
                                 }
-                                else {Write-Debug "No type for resource $($res.Id)"}
+                            }
+                            else {
+                                Write-Debug "This is not a resource: $($subResource.Id)"
+                                Write-Debug "breaking loop, assuming other elements are the same..."
+                                break
                             }
                         }
                     }
@@ -428,7 +489,7 @@ function Get-AcAzResourceAndSubResources {
     }
 }
 
-function Get-AcAzResource {
+function Get-MapAzResource {
     [CmdletBinding()]
     param(
         [Parameter(
@@ -462,12 +523,13 @@ function Get-AcAzResource {
                     if ($ScanSubResources.IsPresent){
                         $providerName = $res.ResourceType.Split("/")[0]
                         $resType = $res.ResourceType.Replace("$providerName/","")
-                        Get-AcAzResourceAndSubResources -SubscriptionId $sub -ResGroup $res.ResourceGroupName -ProviderName $providerName -ResourceName $res.Name -ResourceType $resType
+                        Get-MapAzResourceAndSubResources -SubscriptionId $sub -ResGroup $res.ResourceGroupName -ProviderName $providerName -ResourceName $res.Name -ResourceType $resType
                     } 
                 }                     
             }
                      
         }
+                     
     }
 
     process {
@@ -484,7 +546,7 @@ function Get-AcAzResource {
     }
 }
 
-function Resolve-AccessPlane {
+function Resolve-MapAzAccessPlane {
     [CmdletBinding()]
     param(
         [Parameter()]
@@ -521,7 +583,7 @@ function Resolve-AccessPlane {
             # Cache provider operations once per namespace
             if (-not $OpsByAction.ContainsKey($ns)) {
                 Write-Verbose "Fetching provider operations for namespace '$ns'"
-                $OpsByAction[$action] = Get-AcAzProviderOperations -action $action -IsDataAction $IsDataAction
+                $OpsByAction[$action] = Get-MapAzProviderOperations -action $action -IsDataAction $IsDataAction
             }
 
             #Remove actions negated by not actions
@@ -545,7 +607,7 @@ function Resolve-AccessPlane {
             }
 
             Write-Verbose "Getting resources of type '$prov' under '$ResourceScope'"
-            $resources = Get-AcAzResource -Scope $ResourceScope -ResType $prov
+            $resources = Get-MapAzResource -Scope $ResourceScope -ResType $prov
             Write-Verbose "Found $($resources.Count) matching resources"
 
             $resources | Group-Object -Property ResourceType | ForEach-Object {
@@ -574,7 +636,7 @@ function Resolve-AccessPlane {
     }
 }
 
-function Get-AcARoleAssignmentAccess {
+function Get-MapAzRoleAssignmentAccess {
     [CmdletBinding(DefaultParameterSetName = 'ByUPN')]
     param(
         [Parameter(
@@ -604,7 +666,7 @@ function Get-AcARoleAssignmentAccess {
     }
 
     process {
-        $roles = Get-AcAzRoleDefinitions -roleId $Assignment.RoleDefinitionId
+        $roles = Get-MapAzRoleDefinitions -roleId $Assignment.RoleDefinitionId
         foreach ($role in $roles) {
             $scope = $Assignment.Scope
             if ( -not $global:OpsByRoleAssignment.ContainsKey($Assignment.RoleAssignmentId)){
@@ -616,14 +678,14 @@ function Get-AcARoleAssignmentAccess {
                     $notactions = $role.NotActions
 
                     Write-Verbose "Fetching control plane operations for role '$($Assignment.RoleAssignmentId)'"
-                    Resolve-AccessPlane -Actions $actions -NotActions $notactions -ResourceScope $resScope -Plane "Control" -IsDataAction $false | 
+                    Resolve-MapAzAccessPlane -Actions $actions -NotActions $notactions -ResourceScope $resScope -Plane "Control" -IsDataAction $false | 
                     ForEach-Object { $roleAccessList.Add($_) }
 
                     $dataActions = $role.DataActions
                     $notDataActions = $role.NotDataActions
 
                     Write-Verbose "Fetching data plane operations for role '$($Assignment.RoleAssignmentId)'"
-                    Resolve-AccessPlane -Actions $dataActions -NotActions $notDataActions -ResourceScope $resScope -Plane "Data" -IsDataAction $true |
+                    Resolve-MapAzAccessPlane -Actions $dataActions -NotActions $notDataActions -ResourceScope $resScope -Plane "Data" -IsDataAction $true |
                     ForEach-Object { $roleAccessList.Add($_) }
 
                     $global:OpsByRoleAssignment[$Assignment.RoleAssignmentId] = $roleAccessList
@@ -641,8 +703,7 @@ function Get-AcARoleAssignmentAccess {
     }
 }
 
-
-function Get-AcAzUserAccess {
+function Get-MapAzUserAccess {
     [CmdletBinding(DefaultParameterSetName = 'ByUPN')]
     param(
         [Parameter(
@@ -673,13 +734,13 @@ function Get-AcAzUserAccess {
     begin {
         if ($PSCmdlet.ParameterSetName -eq 'ByUPN') {
         
-            $userassignments = Get-AcAzRoleAssignments -UserName $UserPrincipalName -ErrorAction SilentlyContinue
-            $currUserId = (Get-AcAzUsers -userPrincipalName $UserPrincipalName).Id 
+            $userassignments = Get-MapAzRoleAssignments -UserName $UserPrincipalName -ErrorAction SilentlyContinue
+            $currUserId = (Get-MapAzUsers -userPrincipalName $UserPrincipalName).Id 
             $currUserPrincipalName = $UserPrincipalName
         }
         else {
-            $userassignments = Get-AcAzRoleAssignments -UserId $UserId -ErrorAction SilentlyContinue
-            $currUserPrincipalName = (Get-AcAzUsers -userId $UserId).UserPrincipalName
+            $userassignments = Get-MapAzRoleAssignments -UserId $UserId -ErrorAction SilentlyContinue
+            $currUserPrincipalName = (Get-MapAzUsers -userId $UserId).UserPrincipalName
             $currUserId = $UserId 
 
         }
@@ -695,7 +756,7 @@ function Get-AcAzUserAccess {
     process {
         foreach ($assignment in $userassignments) {
 
-            Get-AcARoleAssignmentAccess -Assignment $assignment -ResourceScope $resScope
+            Get-MapAzRoleAssignmentAccess -Assignment $assignment -ResourceScope $resScope
         }
     }
 
@@ -745,7 +806,7 @@ function Get-AcAzUserAccess {
     }
 }
 
-function Get-AcAzAllUsersAccess {
+function Get-MapAzAllUsersAccess {
     [CmdletBinding()]
     param()
     
@@ -753,7 +814,7 @@ function Get-AcAzAllUsersAccess {
             Write-Host  "Collecting assignments for all users and converting to access objects..."
     }
     process {
-        $allAccess = Get-AcAzUsers | ForEach-Object {Get-AcAzUserAccess -UserId $_.Id}
+        $allAccess = Get-MapAzUsers | ForEach-Object {Get-MapAzUserAccess -UserId $_.Id}
     }
 
     end 
@@ -764,7 +825,8 @@ function Get-AcAzAllUsersAccess {
 
 
 # Export the function when the module is imported
-Export-ModuleMember -Function Get-AcAzUserAssigments,Get-AcAzResource,Test-AcAzUserGroupMembership,
-                                Get-AcAzRoleAssignments,Clear-AcAzScriptCache,Get-AcAzUserAccess,
-                                Get-AcAzUsers,Get-AcAzProviderOperations,Get-AcAzResourceProvider,
-                                Get-AcAzAllUsersAccess,Get-AcAzResourceViaRESTAPI,Get-AcAzResourceAndSubResources
+Export-ModuleMember -Function Get-MapAzUserAssigments,Get-MapAzResource,Test-MapAzUserGroupMembership,
+                                Get-MapAzRoleAssignments,Clear-MapAzScriptCache,Get-MapAzUserAccess,
+                                Get-MapAzUsers,Get-MapAzProviderOperations,Get-MapAzResourceProvider,
+                                Get-MapAzAllUsersAccess,Get-MapAzResourceViaRESTAPI,Get-MapAzResourceAndSubResources,
+                                Get-MapAzResourceViaNativeRESTAPI,Get-MapAzThrottleLimit,Set-MapAzThrottleLimit
