@@ -42,7 +42,7 @@ Each object has the the following fields:
 
 ## Resource Collection
 
-Be default, MapAz will only collect resources available via the ARM API. However, it is possible to try an enumerate more resources:
+By default, MapAz will only collect resources available via the ARM API. However, it is possible to try an enumerate more resources:
 ```PowerShell
 Clear-MapAzScriptCache
 $resources = Get-MapAzResource -ScanSubResources
