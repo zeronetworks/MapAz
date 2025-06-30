@@ -34,9 +34,9 @@ Each object has the the following fields:
 * ResourceId    : full resource path  
 * ResourceName  : name of the resource
 * ResourceType  : shown as <Provider/resourcetype>
-* Operation     : which operation is Microsoft.Compute/virtualMachines/upgradeVMAgent/action
+* Operation     : which allowed operation is allowed
 * OperationType : read/write or action
-* UserId        : Object ID of the user 3a0bbca5-40b7-4f0c-8aba-3e0db66268f7
+* UserId        : Object ID of the user
 * UserName      : Name of the user (if exists)
 * Plane         : Control / Data Plane
 
