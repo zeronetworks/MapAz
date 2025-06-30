@@ -5,15 +5,17 @@ public class EnrichedOp {
     public string ResourceType;
     public string Operation;
     public string OperationType;
+    public string ProviderNamespace;
     public string UserId;
     public string UserName;
     public string Plane;
-    public EnrichedOp(string rid, string rname, string rtype,string op, string optype, string uid, string uname, string pl) {
+    public EnrichedOp(string rid, string rname, string rtype,string op, string optype, string pns,string uid, string uname, string pl) {
         ResourceId   = rid;
         ResourceName = rname;
         ResourceType = rtype;
         Operation    = op;
         OperationType= optype;
+        ProviderNamespace= pns;
         UserId       = uid;
         UserName     = uname;
         Plane        = pl;
@@ -458,10 +460,24 @@ function Get-MapAzResourceAndSubResources {
                 if ($httpResp.StatusCode -eq 200) {
                     try {
                         $subResources = ($httpResp.Content | ConvertFrom-Json).value
+
+                        if (-not (($global:allResources).ResourceId -contains $subResId)){
+                            Write-Host "Found parent resource: $($subResId)" -ForegroundColor Green
+                            $er = [PSCustomObject]@{
+                                Name               = $null
+                                ResourceGroupName  = $ResGroup
+                                ResourceType       = $ResourceType + "/" + $subType
+                                Location           = $null
+                                ResourceId         = $subResId
+                                Tags               = @{}    
+                            }
+                            $global:allResources += $er
+                        }
                     }
                     catch {
                         Write-Debug "Failed to parse JSON for URI $($item.Uri): $($_.Exception.Message)"
                     }
+
                     foreach ($subResource in $subResources){
                         if (($subResource.PSObject.Properties.Name -contains "Id") -and ($subResource.PSObject.Properties.Name -contains "type")){ 
                              if($subResource.type -like "$ProviderName*"){
@@ -602,6 +618,7 @@ function Resolve-MapAzAccessPlane {
                                     ResourceName   = $null
                                     Operation      = $nonResOp.Operation
                                     OperationType  = $nonResOp.Operation.Split('/')[-1]
+                                    ProviderNamespace = $nonResOp.ProviderNamespace
                                     Plane          = "Control"
                                 })
             }
@@ -626,6 +643,7 @@ function Resolve-MapAzAccessPlane {
                                 ResourceName   = $r.Name
                                 Operation      = $mo.Operation
                                 OperationType  = $mo.Operation.Split('/')[-1]
+                                ProviderNamespace = $mo.ProviderNamespace
                                 Plane          = $Plane
                             })
                         }
@@ -788,6 +806,7 @@ function Get-MapAzUserAccess {
                         $op.ResourceType,
                         $op.Operation,
                         $op.OperationType,
+                        $op.ProviderNamespace,
                         $currUserId,
                         $currUserPrincipalName,
                         $op.Plane
